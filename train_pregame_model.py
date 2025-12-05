@@ -5,11 +5,14 @@ Train an XGBoost model for pregame win probability using historical NFL games.
 
 EXPECTED INPUT DATA (CSV):
 - One row per game
-- Columns MUST include at least:
-
-    game_id (optional, for logging)
+- MUST include at least:
     season
     week
+    home_win  (1 if home team won, 0 otherwise)
+
+- It WILL TRY to use these feature columns if present, and will
+  create them with default values if they are missing:
+
     home_pts_for_avg
     home_pts_against_avg
     away_pts_for_avg
@@ -25,24 +28,21 @@ EXPECTED INPUT DATA (CSV):
     is_dome
     weather_temp
     weather_wind
-    home_win  (TARGET: 1 if home team won, 0 otherwise)
 
 USAGE:
 
-1) Export a CSV from your database (Supabase / Lovable) to e.g.:
+1) Put your CSV at:
    data/games_with_features.csv
 
-2) Install dependencies locally:
-   pip install xgboost pandas numpy scikit-learn
+2) Install dependencies:
+   pip3 install xgboost pandas numpy scikit-learn
 
 3) Run:
-   python train_pregame_model.py
+   python3 train_pregame_model.py
 
 4) Output:
-   - models/pregame_xgb.json         (XGBoost model)
-   - models/pregame_feature_order.json  (list of feature names in correct order)
-
-These files will be loaded by your FastAPI ML service.
+   - models/pregame_xgb.json
+   - models/pregame_feature_order.json
 """
 
 import os
@@ -53,7 +53,6 @@ from typing import List, Tuple
 
 from sklearn.metrics import accuracy_score, brier_score_loss
 from xgboost import XGBClassifier
-
 
 # ---------------------------
 # CONFIG
@@ -66,7 +65,8 @@ FEATURE_ORDER_PATH = os.path.join(MODEL_DIR, "pregame_feature_order.json")
 
 TARGET_COL = "home_win"  # 1 if home team won, 0 otherwise
 
-# These must match your GameFeatures fields in server.py
+# These must match how we’ll build features in the ML server.
+# If some are missing in the CSV, we’ll create them with defaults.
 FEATURE_COLS: List[str] = [
     "home_pts_for_avg",
     "home_pts_against_avg",
@@ -88,8 +88,8 @@ FEATURE_COLS: List[str] = [
 SEASON_COL = "season"
 WEEK_COL = "week"
 
-# You can tweak this to hold out the last N seasons for validation
-VALIDATION_MIN_SEASON = 2023  # e.g., train on <= 2022, validate on >= 2023
+# Train on seasons < VALIDATION_MIN_SEASON, validate on >= VALIDATION_MIN_SEASON
+VALIDATION_MIN_SEASON = 2023
 
 
 # ---------------------------
@@ -103,10 +103,11 @@ def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     print(f"Loaded {len(df):,} rows from {path}")
 
-    # Basic sanity check
-    missing_cols = [c for c in FEATURE_COLS + [TARGET_COL, SEASON_COL, WEEK_COL] if c not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns in CSV: {missing_cols}")
+    # Check for absolutely required columns
+    required_base_cols = [TARGET_COL, SEASON_COL, WEEK_COL]
+    missing_base = [c for c in required_base_cols if c not in df.columns]
+    if missing_base:
+        raise ValueError(f"CSV is missing required base columns: {missing_base}")
 
     # Drop rows with missing target
     before = len(df)
@@ -116,35 +117,58 @@ def load_data(path: str) -> pd.DataFrame:
     # Ensure target is 0/1
     df[TARGET_COL] = df[TARGET_COL].astype(int)
 
+    # Handle missing feature columns by creating them with defaults
+    missing_features = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing_features:
+        print("\nWARNING: The following feature columns are missing from the CSV:")
+        for c in missing_features:
+            print(f"  - {c}")
+        print("They will be created with default values so training can continue.\n")
+
+    for col in FEATURE_COLS:
+        if col not in df.columns:
+            # Choose reasonable defaults
+            if col in ["is_primetime", "is_divisional", "is_dome"]:
+                default_value = 0
+            elif col in ["weather_temp"]:
+                default_value = 70.0  # neutral football weather
+            elif col in ["weather_wind"]:
+                default_value = 5.0   # light wind
+            elif col in ["home_rest_days", "away_rest_days"]:
+                default_value = 7
+            else:
+                default_value = 0.0
+
+            df[col] = default_value
+
     return df
 
 
 def time_based_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Train on seasons < VALIDATION_MIN_SEASON, validate on seasons >= VALIDATION_MIN_SEASON.
-    This avoids peeking into the future.
-    """
+    """Prefer time-based split; if that fails, fall back to random split."""
     train_df = df[df[SEASON_COL] < VALIDATION_MIN_SEASON].copy()
     val_df = df[df[SEASON_COL] >= VALIDATION_MIN_SEASON].copy()
 
     if train_df.empty or val_df.empty:
-        raise ValueError(
-            f"Train or validation split is empty. "
-            f"Check VALIDATION_MIN_SEASON={VALIDATION_MIN_SEASON} and your data's {SEASON_COL} range."
+        # Fallback: random 80/20 split if seasons don’t support a clean boundary
+        print(
+            f"Time-based split failed (train or val empty). "
+            f"Falling back to random 80/20 split."
         )
+        df_shuffled = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        split_idx = int(0.8 * len(df_shuffled))
+        train_df = df_shuffled.iloc[:split_idx].copy()
+        val_df = df_shuffled.iloc[split_idx:].copy()
 
     print(
-        f"Train set: {len(train_df):,} rows (seasons <= {VALIDATION_MIN_SEASON - 1}), "
-        f"Val set: {len(val_df):,} rows (seasons >= {VALIDATION_MIN_SEASON})"
+        f"Train set: {len(train_df):,} rows, "
+        f"Val set: {len(val_df):,} rows"
     )
 
     return train_df, val_df
 
 
 def build_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convert DataFrame into X (features) and y (target) with fixed FEATURE_COLS order.
-    """
     X = df[FEATURE_COLS].copy()
 
     # Convert boolean-like fields to 0/1 if needed
@@ -152,12 +176,11 @@ def build_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         if col in X.columns:
             if X[col].dtype == bool:
                 X[col] = X[col].astype(int)
-            # If it's strings like "true"/"false", map them
             if X[col].dtype == object:
-                X[col] = X[col].str.lower().map({"true": 1, "false": 0})
+                X[col] = X[col].astype(str).str.lower().map({"true": 1, "false": 0})
             X[col] = X[col].fillna(0)
 
-    # Basic numeric fill
+    # Numeric fill
     X = X.fillna(0.0)
 
     y = df[TARGET_COL].values.astype(int)
@@ -169,12 +192,12 @@ def build_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 # TRAINING
 # ---------------------------
 
-def train_xgb_model(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> XGBClassifier:
-    """
-    Train an XGBoost classifier with reasonable defaults and early stopping.
-    """
-
-    # Rough class balance
+def train_xgb_model(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray
+) -> XGBClassifier:
     pos_rate = y_train.mean()
     print(f"Positive class rate in train data (home_win=1): {pos_rate:.3f}")
 
@@ -189,19 +212,19 @@ def train_xgb_model(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray,
         n_jobs=4,
         reg_lambda=1.0,
         reg_alpha=0.0,
-        tree_method="hist",  # good default for CPU
+        tree_method="hist",
         random_state=42,
     )
 
     eval_set = [(X_train, y_train), (X_val, y_val)]
 
     print("Training XGBoost model...")
+    # Compatible with XGBoost 2.x: no early_stopping_rounds kwarg
     model.fit(
         X_train,
         y_train,
         eval_set=eval_set,
         verbose=True,
-        early_stopping_rounds=30,
     )
 
     return model
@@ -212,9 +235,6 @@ def train_xgb_model(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray,
 # ---------------------------
 
 def evaluate_model(model: XGBClassifier, X: np.ndarray, y: np.ndarray, split_name: str) -> None:
-    """
-    Print accuracy and Brier score for a given split.
-    """
     y_prob = model.predict_proba(X)[:, 1]
     y_pred = (y_prob >= 0.5).astype(int)
 
@@ -246,27 +266,20 @@ def save_artifacts(model: XGBClassifier, feature_cols: List[str]) -> None:
 # ---------------------------
 
 def main():
-    # 1) Load data
     df = load_data(DATA_CSV_PATH)
-
-    # 2) Split train/val by season
     train_df, val_df = time_based_split(df)
 
-    # 3) Build feature matrices
     X_train, y_train = build_feature_matrix(train_df)
     X_val, y_val = build_feature_matrix(val_df)
 
     print(f"Training matrix: {X_train.shape[0]:,} rows x {X_train.shape[1]} features")
     print(f"Validation matrix: {X_val.shape[0]:,} rows x {X_val.shape[1]} features")
 
-    # 4) Train model
     model = train_xgb_model(X_train, y_train, X_val, y_val)
 
-    # 5) Evaluate
     evaluate_model(model, X_train, y_train, "Train")
     evaluate_model(model, X_val, y_val, "Validation")
 
-    # 6) Save artifacts
     save_artifacts(model, FEATURE_COLS)
 
 

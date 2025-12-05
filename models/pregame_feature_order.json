@@ -1,0 +1,17 @@
+[
+  "home_pts_for_avg",
+  "home_pts_against_avg",
+  "away_pts_for_avg",
+  "away_pts_against_avg",
+  "vegas_spread",
+  "vegas_total",
+  "home_moneyline",
+  "away_moneyline",
+  "home_rest_days",
+  "away_rest_days",
+  "is_primetime",
+  "is_divisional",
+  "is_dome",
+  "weather_temp",
+  "weather_wind"
+]
