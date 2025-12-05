@@ -6,6 +6,7 @@ import os
 import json
 
 from xgboost import XGBClassifier
+import uvicorn
 
 # -------------------------------------------------
 # CONFIG & MODEL LOADING
@@ -37,8 +38,8 @@ def load_model_artifacts():
         )
 
     print(f"Loading model from {MODEL_PATH} ...")
-    model = XGBClassifier()
-    model.load_model(MODEL_PATH)
+    model_local = XGBClassifier()
+    model_local.load_model(MODEL_PATH)
 
     print(f"Loading feature order from {FEATURE_ORDER_PATH} ...")
     with open(FEATURE_ORDER_PATH, "r") as f:
@@ -47,16 +48,23 @@ def load_model_artifacts():
     if not isinstance(feature_order_json, list):
         raise RuntimeError("feature_order JSON is not a list.")
 
-    # Ensure all entries are strings
-    global feature_order
-    feature_order = [str(c) for c in feature_order_json]
+    feature_order_local = [str(c) for c in feature_order_json]
+
+    # Only assign to globals after everything loaded successfully
+    global model, feature_order
+    model = model_local
+    feature_order = feature_order_local
 
     print(f"Model and feature order loaded. {len(feature_order)} features.")
 
 
 @app.on_event("startup")
 def on_startup():
-    load_model_artifacts()
+    try:
+        load_model_artifacts()
+    except Exception as e:
+        # Log but don't crash app startup so /v1/health can still report failure
+        print(f"Error loading model artifacts on startup: {e}")
 
 
 # -------------------------------------------------
@@ -120,7 +128,7 @@ class MLPredictResponse(BaseModel):
 class BatchPregameRequest(BaseModel):
     games: List[GameFeaturesPregame]
     include_ensemble: bool = False
-    include_vegas_edge: bool = False  # not implemented yet, placeholder
+    include_vegas_edge: bool = False  # placeholder
 
 
 class BatchPregameResponse(BaseModel):
@@ -159,30 +167,29 @@ def build_feature_vector(game: GameFeaturesPregame) -> np.ndarray:
 
 def predict_pregame_internal(game: GameFeaturesPregame) -> MLPredictResponse:
     X = build_feature_vector(game)
-    y_prob = model.predict_proba(X)[:, 1][0]  # probability home team wins
+    y_prob = float(model.predict_proba(X)[:, 1][0])  # probability home team wins
 
     # Simple heuristic for ATS/total based on probabilities:
-    # You can later replace this with more advanced regression models.
     ats_margin = (y_prob - 0.5) * 10.0  # ~10 point swing from 0–1
-    total_points = game.vegas_total if hasattr(game, "vegas_total") else 44.5
+
+    total_points = float(getattr(game, "vegas_total", 44.5))
 
     # Split total into home/away prediction biased by win probability
     home_team_total = total_points * (0.5 + (y_prob - 0.5) * 0.3)
     away_team_total = total_points - home_team_total
 
-    # Confidence: push more confident as p moves away from 0.5
     confidence = 0.5 + abs(y_prob - 0.5)
 
     return MLPredictResponse(
-        win_probability=float(y_prob),
+        win_probability=y_prob,
         ats_margin=float(ats_margin),
-        total_points=float(total_points),
+        total_points=total_points,
         home_team_total=float(home_team_total),
         away_team_total=float(away_team_total),
         confidence=float(confidence),
         model_version=MODEL_VERSION,
         ensemble=EnsembleDetails(
-            xgboost_prob=float(y_prob),
+            xgboost_prob=y_prob,
             ensemble_method="xgboost_only",
             meta_learner_weights={"xgboost": 1.0},
         ),
@@ -224,7 +231,6 @@ def predict_pregame(game: GameFeaturesPregame):
 
 @app.post("/v1/predict/ensemble", response_model=MLPredictResponse)
 def predict_ensemble(game: GameFeaturesPregame):
-    # For now, same as pregame but with ensemble field filled.
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
     return predict_pregame_internal(game)
@@ -243,3 +249,12 @@ def predict_batch(request: BatchPregameRequest):
         predictions=preds,
         model_version=MODEL_VERSION,
     )
+
+
+# -------------------------------------------------
+# LOCAL ENTRY POINT (for Render if it runs `python server.py`)
+# -------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
